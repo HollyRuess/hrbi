@@ -1,0 +1,271 @@
+#!/bin/bash
+#####################################################################################################################################################   
+###  title          :hrbi.simple_reseq_walker                                                                                                     ###
+###  description    :Resequencing data can usually be mapped to a good reference sequence. But sometimes reads cannot map to introns or large     ###
+###                  insertions due to sequence differences. This program can take two scaffolds and try to connect them in a homozygous,         ###
+###                  unmappable region.                                                                                                           ###
+###  author	    :Holly Ruess (Holly.Ruess@ars.usda.gov)                                                                                       ###
+###  date           :04-05-2016                                                                                                                   ###
+###  version        :1                                                                                                                            ###   
+###  notes          :Latest versions of BWA-MEM, SAMtools, MUSCLE, and perl -MBio::AlignIO must be installed and available within PATH.           ###
+#####################################################################################################################################################
+
+usage="$(basename "$0") -1 <fastq1> -2 <fastq2> -R <reference_fasta> -i <insert_size> [-L <iterations>] [-B <barcode_sequence>]
+
+For use with Illumina paired-end reads in a homozygous reference region.
+Latest versions of BWA-MEM, SAMtools, MUSCLE, and perl -MBio::AlignIO must be installed and available within PATH. Tested with bwa-0.7.13, samtools-0.1.19, muscle.3.8.31, and perl v5.18.2.
+The final output will be from either 1) Stopped because too high of coverage area to continue 2) Stopped because no new sequence could be added 3) Stopped because left and right sides probably meet 4) Stopped because it completed all the iterations. Please see last line in log for more information.
+The final sequence may have errors in it due to the extension process. A final mapping and calling of SNPs and indels is necessary see hrbi.simple_reseq_finisher for more information.
+
+Required parameters:
+    -1 FILENAME  Path and filename for cleaned Illumina fastq 1 file (example: /usr/local/bin/sample.1.fastq.gz).
+                 Note: File can be uncompressed (*.fastq) or compressed (*.fastq.gz).
+    -2 FILENAME  Path and filename for cleaned Illumina fastq 2 file (example: /usr/local/bin/sample.2.fastq.gz).
+                 Note: File can be uncompressed (*.fastq) or compressed (*.fastq.gz).
+    -R FILENAME  Path and filename for input reference fasta file (example: /usr/local/bin/reference.fa).
+                 Note1: The reference should be two lines, Line 1 is the header (Keep short and only use letters, numbers, and periods; 
+                 example: >Dcarota.1234), and line 2 the sequence (case insensitive).
+                 Note2: The reference contains the two scaffolds separated by 10 N's (example: ATCGNNNNNNNNNNATCG).
+                 Note3: The header name will be the sample output name for the program.
+    -i INT       Illumina paired end insert size (example: 350; if the insert size is 350 bp).
+
+Optional parameters:
+    -L INT       maximum number of iterations before stopping (default value: 100).
+    -B STR       Sequencing barcode. Can assist with sequence identification, but not necessary. 
+                 Only use uppercase A,T,C,G (example: TGACCA) (default: ATCG).
+    -C INT       Predicted coverage of region (example: 100) (default: 1000).
+                 Note: The program will not work well in a repeat or extremely high coverage area. Maximum allowable coverage is 3X average.
+    -t INT       Number of threads; recommend 8 or more (default: 1).
+
+    -h           Show this help text.
+"
+
+if [ $# -eq 0 ]; then
+    echo "$usage"
+    exit 0
+else
+
+nloops=100
+LB="ATCG"
+Coverage=1000
+threads=1
+
+
+while getopts ':1:2:R:i:L:B:C:t:h' option; do
+  case "$option" in
+    1) fastq1=$OPTARG
+       ;;
+    2) fastq2=$OPTARG
+       ;;
+    R) REF_file_original=$OPTARG
+       ;;
+    i) insert_size=$OPTARG
+       ;;
+    L) nloops=$OPTARG
+       ;;
+    B) LB=$OPTARG
+       ;;
+    C) Coverage=$OPTARG
+       ;;
+    t) threads=$OPTARG
+       ;;
+    :) printf "missing argument for -%s\n\n" "$OPTARG" >&2
+       echo "$usage" >&2
+       exit 1
+       ;;
+    h) echo "$usage"
+       exit 1
+       ;;
+   \?) printf "illegal option: -%s\n\n" "$OPTARG" >&2
+       echo "$usage" >&2
+       exit 1
+       ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+###Check if all necessary files and programs are present
+errors=1
+if [ ! -e "$fastq1" ]; then
+    echo "Error: Fastq1 path and filename does not exist (-1)"
+    errors=0
+fi
+
+if [ ! -e "$fastq2" ]; then
+    echo "Error: Fastq2 path and filename does not exist (-2)"
+    errors=0
+fi
+
+if [ ! -e "$REF_file_original" ]; then
+    echo "Error: Reference fasta path and filename does not exist (-R)"
+    errors=0
+else
+    if [ ! `grep "NNNNNNNNNN" $REF_file_original` ]; then 
+        echo "Error: Reference file is not in the correct format. Two scaffolds need to be separated by 10 N's (example: ATCGNNNNNNNNNNATCG)"
+        errors=0
+    fi
+    ref_lines=`wc -l $REF_file_original | cut -c 1-2`
+    if [ "$ref_lines" != "2 " ]; then
+        echo "Error: The reference should be two lines, Line 1 is the header (example: >Dcarota.1234), and line 2 the sequence"
+        errors=0
+    fi
+fi
+
+if [ ! "$insert_size" ]; then
+    echo "Error: Insert size not stated (-i)"
+    errors=0
+fi
+
+perl_check=`which perl 2> /dev/null | wc -l`
+if [ $perl_check == 0 ]; then
+    echo "Perl is not available in PATH"
+    errors=0
+fi
+
+perl_module_check=`perl -MBio::AlignIO -e 1 2>&1 | wc -l`
+if [ $perl_module_check -ge 1 ]; then
+    echo "Perl -MBio::AlignIO is not installed"
+    errors=0
+fi
+
+muscle_check=`which muscle 2> /dev/null | wc -l`
+if [ $muscle_check == 0 ]; then
+    echo "MUSCLE is not available in PATH (http://drive5.com/muscle/)"
+    errors=0
+fi
+
+bwa_check=`which bwa 2> /dev/null | wc -l`
+if [ $bwa_check == 0 ]; then
+    echo "BWA-MEM is not available in PATH (http://bio-bwa.sourceforge.net/)"
+    errors=0
+fi
+
+samtools_check=`which samtools 2> /dev/null | wc -l`
+if [ $samtools_check == 0 ]; then
+    echo "SAMtools is not available in PATH (http://samtools.sourceforge.net/)"
+    errors=0
+fi
+
+if [ $errors == 0 ]; then
+    exit 2
+fi
+
+
+cp $REF_file_original copy.$REF_file_original
+REF_file="copy.$REF_file_original"
+Index="$REF_file.fai"
+PI=`grep ">" $REF_file | cut -c 2-`
+RG="@RG\tID:$PI\tLB:$LB\tPL:illumina\tSM:$PI\tPI:$insert_size"
+
+##################################################Start commands##################################################
+
+while [ $nloops -ge 1 ]; do
+
+rm -f $REF_file.* *$PI.bam*
+
+###Index Reference
+if [ ! -e $Index ]; then
+    bwa index $REF_file
+    samtools faidx $REF_file
+else
+    echo "Reference file is indexed"
+fi
+wait
+
+###Map all reads to reference; sort and index
+if [ ! -e $PI.bam ]; then
+    bwa mem -a -M -t $threads -R $RG $REF_file $fastq1 $fastq2 | awk '$3 != "*"' >$PI.sam
+    samtools view -bt $Index -o $PI.delete.bam $PI.sam
+    samtools sort $PI.delete.bam $PI
+    samtools index $PI.bam
+else
+    echo "Initial BAM file has been created"
+fi
+wait
+
+rm -f $PI.sam $PI.delete.bam
+
+###Find the position of N's, pull reads mapping to that position, align reads, and replace new sequence in reference files
+position=`awk 'END{print index($0,"NNNNNNNNNN")}' $REF_file`
+left_pos=$((position-5))
+right_pos=$((position+15))
+
+samtools view -b $PI.bam $PI:$left_pos-$left_pos >left.bam
+samtools view -b $PI.bam $PI:$right_pos-$right_pos >right.bam
+
+samtools view left.bam | awk '{OFS="\t"; if ($left_pos - $4 <= 50) print ">"$1"\n"$10}' - >left.fasta
+samtools view right.bam | awk '{OFS="\t"; if ($4 - $right_pos >= 50) print ">"$1"\n"$10}' - >right.fasta
+
+left_lines=`wc -l left.fasta | cut -f1 -d' '`
+left_coverage=$((left_lines/2))
+max_coverage=$((Coverage*3))
+if [ "$left_coverage" -le "$max_coverage" ]; then
+    muscle -in left.fasta -out left_aligned.fasta
+    perl -MBio::AlignIO -e 'my $aln = Bio::AlignIO->new(-file => shift); my $str = $aln->next_aln(); print $str->consensus_string(1)' left_aligned.fasta >left_consensus.fasta
+    sed -i 's|?||g' left_consensus.fasta
+fi
+
+right_lines=`wc -l right.fasta | cut -f1 -d' '`
+right_coverage=$((right_lines/2))
+if [ "$right_coverage" -le "$max_coverage" ]; then
+    muscle -in right.fasta -out right_aligned.fasta
+    perl -MBio::AlignIO -e 'my $aln = Bio::AlignIO->new(-file => shift); my $str = $aln->next_aln(); print $str->consensus_string(1)' right_aligned.fasta >right_consensus.fasta
+    sed -i 's|?||g' right_consensus.fasta
+fi
+
+old_left_seq_part=`perl -lne 'print $1 if /(([ATCGatcg]{15})[ATCGatcg]{20}N{10})/' $REF_file | cut -c 1-15`
+old_left_seq_all=`perl -lne 'print $1 if /(([ATCGatcg]{15})[ATCGatcg]{20}N{10})/' $REF_file | cut -c 1-35`
+new_left_seq=`perl -lne 'print lc($1) if /('$old_left_seq_part'(\w*)$)/' left_consensus.fasta`
+find_left_sequence=`perl -ne 'm/('$old_left_seq_all')/; {print "$1\n";}' $REF_file`
+count_left_sequence=`grep -oi $find_left_sequence $REF_file | wc -l`
+check_new_left_seq=`echo $new_left_seq | wc -c`
+if ([ $count_left_sequence -eq 1 ] && [ $check_new_left_seq -ge 35 ]); then
+    sed 's|'$old_left_seq_all'|'$new_left_seq'|' $REF_file >NewReference.fa
+else
+    cp $REF_file NewReference.fa
+fi
+
+old_right_seq_part=`perl -lne 'print $1 if /(N{10}[ATCGatcg]{20}([ATCGatcg]{15}))/' $REF_file | cut -c 31-`
+old_right_seq_all=`perl -lne 'print $1 if /(N{10}[ATCGatcg]{20}([ATCGatcg]{15}))/' $REF_file | cut -c 11-`
+new_right_seq=`perl -lne 'print lc($1) if /(^(\w*)'$old_right_seq_part')/' right_consensus.fasta`
+find_right_sequence=`perl -ne 'm/('$old_right_seq_all')/; {print "$1\n";}' $REF_file`
+count_right_sequence=`grep -oi $find_right_sequence $REF_file | wc -l`
+check_new_right_seq=`echo $new_right_seq | wc -c`
+if ([ $count_right_sequence -eq 1 ] && [ $check_new_right_seq -ge 35 ]); then
+    sed -i 's|'$old_right_seq_all'|'$new_right_seq'|' NewReference.fa
+fi
+
+###Check to see if the program should continue or state why it ended
+original_size=`wc -c $REF_file | cut -f1 -d' '`
+new_size=`wc -c NewReference.fa | cut -f1 -d' '`
+find_left_stop=`perl -ne 'm/([ATCGatcg]{20})N{10}/; {print "$1\n";}' NewReference.fa`
+count_left_stop=`grep -oi $find_left_stop NewReference.fa | wc -l`
+find_right_stop=`perl -ne 'm/N{10}([ATCGatcg]{20})/; {print "$1\n";}' NewReference.fa`
+count_right_stop=`grep -oi $find_right_stop NewReference.fa | wc -l`
+if ([ "$right_coverage" -gt "$max_coverage" ] && [ "$left_coverage" -gt "$max_coverage" ]); then
+    echo "Both left and right sides have too high coverage to continue"
+    cp NewReference.fa ${PI}_loop${nloops}.fa
+    nloops=0
+    mv NewReference.fa $PI.final_walker.fa
+elif [ $original_size -ge $new_size ]; then
+    echo "No new sequence could be added"
+    cp NewReference.fa ${PI}_loop${nloops}.fa
+    nloops=0
+    mv NewReference.fa $PI.final_walker.fa
+elif ([ $count_left_stop -ge 2 ] && [ $count_right_stop -ge 2 ]); then
+    echo "The left side and right side probably meet."
+    cp NewReference.fa ${PI}_loop${nloops}.fa
+    nloops=0
+    mv NewReference.fa $PI.final_walker.fa
+else
+    cp NewReference.fa ${PI}_loop${nloops}.fa
+    mv NewReference.fa $REF_file
+    nloops=$((nloops-1))
+fi
+
+done ###while nloops -ge 1 
+
+rm -f copy.$REF_file_original* left.bam right.bam left.fasta right.fasta left_aligned.fasta left_consensus.fasta right_aligned.fasta right_consensus.fasta
+
+fi ###done with checking if there was no input, need at all times
+##################################################End commands##################################################
