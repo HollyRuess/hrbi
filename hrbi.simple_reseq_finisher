@@ -1,0 +1,209 @@
+#!/bin/bash
+#####################################################################################################################################################   
+###  title          :hrbi.simple_reseq_finisher                                                                                                   ###
+###  description    :This program is a complement to hrbi.simple_reseq_walker. It takes the final output file (*.final_walker.fa) and corrects    ###
+###                  the errors that were generated.                                                                                              ###
+###  author	    :Holly Ruess (Holly.Ruess@ars.usda.gov)                                                                                       ###
+###  date           :04-05-2016                                                                                                                   ###
+###  version        :1                                                                                                                            ###   
+###  notes          :Latest versions of BWA-MEM and SAMtools must be installed and available within PATH. Also install the latest version of      ###
+###                  Picard Tools and GATK and make the corresponding version of java available within PATH.                                      ###
+#####################################################################################################################################################
+
+usage="$(basename "$0") -1 <fastq1> -2 <fastq2> -R <reference_fasta> -i <insert_size> -B <barcode_sequence>
+
+For use with Illumina paired-end reads in a homozygous reference region.
+Latest versions of BWA-MEM and SAMtools must be installed and available within PATH. Also install the latest version of Picard Tools and GATK and make the corresponding version of java available within PATH. Tested with bwa-0.7.13, samtools-0.1.19, Picard Tools 1.127, GATK 3.5-0-g36282e4, and java 1.7.0_80.
+The final output will be a fasta file that has sequence added (from hrbi.simple_reseq_walker) and sequence corrected for SNP's and indels. Completeness and correctness of sequence is still dependant on the quality and quantity of of initial fastq files, as well as the lack of sequence heterozygosity or repetitiveness.
+
+Required parameters:
+    -1 FILENAME  Path and filename for cleaned Illumina fastq 1 file (example: /usr/local/bin/sample.1.fastq.gz)
+                 Note: File can be uncompressed (*.fastq) or compressed (*.fastq.gz)
+    -2 FILENAME  Path and filename for cleaned Illumina fastq 2 file (example: /usr/local/bin/sample.2.fastq.gz)
+                 Note: File can be uncompressed (*.fastq) or compressed (*.fastq.gz)
+    -R FILENAME  Path and filename for input reference fasta file (example: /usr/local/bin/reference.final_walker.fa).
+                 Note1: The reference should be two lines, Line 1 is the header (Keep short and only use letters, numbers, and periods; 
+                 example: >Dcarota.1234), and line 2 the sequence (case-insensitive).
+                 Note2: The reference contains the two scaffolds separated by 10 N's (example: ATCGNNNNNNNNNNATCG).
+                 Note3: The header name will be the sample output name for the program.
+    -i INT       Illumina paired end insert size (example: 350; if the insert size is 350 bp)
+    -P FILENAME  Path and filename for Picard Tools (example: /usr/local/bin/picard-tools/picard.jar)
+    -G FILENAME  Path and filename for the GATK (example: /usr/local/bin/GenomeAnalysisTK/GenomeAnalysisTK.jar)
+
+Optional parameters:
+    -B STR       Sequencing barcode. Can assist with sequence identification; necessary for GATK. 
+                 Only use uppercase A,T,C,G (example: TGACCA) (default: ATCG).
+    -t INT       Number of threads; recommend 8 or more (default: 1).
+
+    -h           Show this help text
+"
+
+if [ $# -eq 0 ]; then
+    echo "$usage"
+    exit 0
+else
+
+threads=1
+LB="ATCG"
+
+while getopts ':1:2:R:i:P:G:B:t:h' option; do
+  case "$option" in
+    1) fastq1=$OPTARG
+       ;;
+    2) fastq2=$OPTARG
+       ;;
+    R) REF_file=$OPTARG
+       ;;
+    i) insert_size=$OPTARG
+       ;;
+    P) picard_path=$OPTARG
+       ;;
+    G) GATK_path=$OPTARG
+       ;;
+    B) LB=$OPTARG
+       ;;
+    t) threads=$OPTARG
+       ;;
+    :) printf "missing argument for -%s\n\n" "$OPTARG" >&2
+       echo "$usage" >&2
+       exit 1
+       ;;
+    h) echo "$usage"
+       exit 1
+       ;;
+   \?) printf "illegal option: -%s\n\n" "$OPTARG" >&2
+       echo "$usage" >&2
+       exit 1
+       ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+###Check if all neccessary files and programs are present
+errors=1
+if [ ! -e "$fastq1" ]; then
+    echo "Error: Fastq1 path and filename does not exist (-1)"
+    errors=0
+fi
+
+if [ ! -e "$fastq2" ]; then
+    echo "Error: Fastq2 path and filename does not exist (-2)"
+    errors=0
+fi
+
+if [ ! -e "$REF_file" ]; then
+    echo "Error: Reference fasta path and filename does not exist (-R)"
+    errors=0
+else
+    if [ ! `grep "NNNNNNNNNN" $REF_file` ]; then 
+        echo "Error: Reference file is not in the correct format. Two scaffolds need to be separated by 10 N's (example: ATCGNNNNNNNNNNATCG)"
+        errors=0
+    fi
+    ref_lines=`wc -l $REF_file | cut -c 1-2`
+    if [ "$ref_lines" != "2 " ]; then
+        echo "Error: The reference should be two lines, Line 1 is the header (example: >Dcarota1234), and line 2 the sequence"
+        errors=0
+    fi
+fi
+
+if [ ! "$insert_size" ]; then
+    echo "Error: Insert size not stated (-i)"
+    errors=0
+fi
+
+if [ ! -e "$picard_path" ]; then
+    echo "Error: Picard Tools path and filename does not exist (-P)"
+    errors=0
+fi
+
+if [ ! -e "$GATK_path" ]; then
+    echo "Error: The GATK path and filename does not exist (-G)"
+    errors=0
+fi
+
+bwa_check=`which bwa 2> /dev/null | wc -l`
+if [ $bwa_check == 0 ]; then
+    echo "BWA-MEM is not available in PATH (http://bio-bwa.sourceforge.net/)"
+    errors=0
+fi
+
+samtools_check=`which samtools 2> /dev/null | wc -l`
+if [ $samtools_check == 0 ]; then
+    echo "SAMtools is not available in PATH (http://samtools.sourceforge.net/)"
+    errors=0
+fi
+
+java_check=`which java 2> /dev/null | wc -l`
+if [ $java_check == 0 ]; then
+    echo "Java is not available in PATH"
+    errors=0
+fi
+
+if [ $errors == 0 ]; then
+    exit 2
+fi
+
+PI=`grep ">" $REF_file | cut -c 2-`
+RG="@RG\tID:$PI\tLB:$LB\tPL:illumina\tSM:$PI\tPI:$insert_size"
+Index="$REF_file.fai"
+
+
+##################################################Start commands##################################################
+####Check to see if you can run this program, and make new reference without the N's
+
+rm -f $PI.ref_finisher.fa $PI.finisher.bam $PI.finisher_GATK.vcf
+
+if [ ! -e $PI.ref_finisher.fa ]; then
+    find_left_stop=`perl -ne 'm/([ATCGatcg]{20})N{10}/; {print "$1\n";}' $REF_file | grep .`
+    count_left_stop=`grep -oi $find_left_stop $REF_file | wc -l`
+    find_right_stop=`perl -ne 'm/N{10}([ATCGatcg]{20})/; {print "$1\n";}' $REF_file`
+    count_right_stop=`grep -oi $find_right_stop $REF_file | wc -l`
+    if ([ $count_left_stop -ge 2 ] && [ $count_right_stop -ge 2 ]); then
+        sed  -e 's|'$find_left_stop'[N]\{10\}[ATCGatcg]*'$find_left_stop'|'$find_left_stop'|' $REF_file >$PI.ref_finisher.fa
+    else
+        echo "Left and right sides do not meet. This program cannot be used"
+        exit 1
+    fi
+else
+    echo "The finisher reference file has already been created"
+fi
+
+
+Finisher_REF_file="$PI.ref_finisher.fa"
+
+
+###Map reads to newly created sequence and mark duplicates
+if [ ! -e $PI.finisher.bam ]; then
+    bwa index $Finisher_REF_file
+    samtools faidx $Finisher_REF_file
+    bwa mem -a -M -t $threads -R $RG $Finisher_REF_file $fastq1 $fastq2 | awk '$3 != "*"' >$PI.finisher.sam
+    samtools view -bt $Index -o $PI.finisher_delete.bam $PI.finisher.sam
+    samtools sort $PI.finisher_delete.bam $PI.finisher_delete2
+    java -Xmx2g -jar $picard_path MarkDuplicates I=$PI.finisher_delete2.bam M=metrics.$PI.finisher.txt MAX_FILE_HANDLES_FOR_READ_ENDS_MAP=900 O=$PI.finisher.bam
+    samtools index $PI.finisher.bam
+else
+    echo "BAM file has been created"
+fi
+
+rm -f $PI.finisher.sam $PI.finisher_delete.bam $PI.finisher_delete2.bam
+
+###Run the GATK to find SNP's and indels.
+if [ ! -e $PI.finisher_GATK.vcf ]; then
+    java -jar -Xmx2g $picard_path CreateSequenceDictionary REFERENCE=$Finisher_REF_file OUTPUT=$PI.ref_finisher.dict
+    java -jar -Xmx2g $GATK_path -T RealignerTargetCreator -R $Finisher_REF_file -I $PI.finisher.bam -o $PI.target_intervals.list
+    java -jar -Xmx2g $GATK_path -T IndelRealigner -R $Finisher_REF_file -I $PI.finisher.bam -targetIntervals $PI.target_intervals.list -o $PI.finisher_realigned.bam
+    java -jar -Xmx2g $GATK_path -R $Finisher_REF_file -T HaplotypeCaller -I $PI.finisher_realigned.bam -o $PI.finisher_GATK.vcf
+else
+    echo "SNP's and indels have already been called"
+fi
+
+###Find the variants and replace them inside the fasta file
+if [ ! -e $PI.finisher_final.fa ]; then
+    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $Finisher_REF_file -o $PI.final_finisher.fa -V $PI.finisher_GATK.vcf -raw
+    sed -i '1s/^/>'$PI'\n/' $PI.final_finisher.fa
+fi
+
+rm -f $Finisher_REF_file.* $PI.ref_finisher.dict $PI.finisher.bam $PI.target_intervals.list
+
+fi ###done with checking if there was no input, need at all times
+##################################################End commands##################################################
