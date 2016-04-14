@@ -1,0 +1,321 @@
+#!/bin/bash
+#####################################################################################################################################################   
+###  title          :hrbi.complex_reseq_walker                                                                                                    ###
+###  description    :Resequencing data can usually be mapped to a good reference sequence. But sometimes reads cannot map to introns or large     ###
+###                  insertions due to sequence differences. This program can take two scaffolds and try to connect them in a heterozygous,       ###
+###                  unmappable region.                                                                                                           ###
+###  author	    :Holly Ruess (Holly.Ruess@ars.usda.gov)                                                                                       ###
+###  date           :04-06-2016                                                                                                                   ###
+###  version        :1                                                                                                                            ###   
+###  notes          :Latest versions of BWA-MEM, SAMtools, MUSCLE, and perl -MBio::AlignIO must be installed and available within PATH. Also      ###
+###                  install the latest versions of Picard Tools and GATK, and make the corresponding version of java available within PATH.      ###
+#####################################################################################################################################################
+
+usage="$(basename "$0") -1 <fastq1> -2 <fastq2> -R <reference_fasta> -i <insert_size> -P <Picard_Tools> -G <GATK> [-L <iterations>] [-B <barcode_sequence>] [-C <coverage>] [-t <threads>]
+
+For use with Illumina paired-end reads in a heterozygous reference region.
+Latest versions of BWA-MEM, SAMtools, MUSCLE, and perl -MBio::AlignIO must be installed and available within PATH. Also, install the latest versions of Picard Tools and GATK and make the corresponding version of java available within PATH. Tested with bwa-0.7.13, samtools-0.1.19, muscle.3.8.31, perl v5.18.2, Picard Tools 1.127, GATK 3.5-0-g36282e4, and java 1.7.0_80.
+The final output will be from either 1) Stopped because too high of coverage area to continue 2) Stopped because no new sequence could be added 3) Stopped because left and right sides probably meet 4) Stopped because it completed all the iterations. Please see last line in log for more information.
+The final sequence may have errors in it due to the extension process. A final mapping and calling of SNPs and indels is necessary see hrbi.complex_reseq_finisher for more information.
+
+Required parameters:
+    -1 FILENAME  Path and filename for cleaned or uncleaned Illumina fastq 1 file (example: /usr/local/bin/sample.1.fastq.gz).
+                 Note: File can be uncompressed (*.fastq) or compressed (*.fastq.gz).
+    -2 FILENAME  Path and filename for cleaned or uncleaned Illumina fastq 2 file (example: /usr/local/bin/sample.2.fastq.gz).
+                 Note: File can be uncompressed (*.fastq) or compressed (*.fastq.gz).
+    -R FILENAME  Path and filename for input reference fasta file (example: /usr/local/bin/reference.fa).
+                 Note1: The reference should be two lines, Line 1 is the header (Keep short and only use letters, numbers, and periods; 
+                 example: >Dcarota.1234), and line 2 the sequence (case insensitive).
+                 Note2: The reference contains 10 N's in the sequence at either the beginning (example: NNNNNNNNNNATCG), 
+                        middle (example: ATCGNNNNNNNNNNATCG), or end (example: ATCGNNNNNNNNNN).
+                 Note3: The header name will be the sample output name for the program.
+    -i INT       Illumina paired end insert size (example: 350; if the insert size is 350 bp).
+    -P FILENAME  Path and filename for Picard Tools (example: /usr/local/bin/picard-tools/picard.jar)
+    -G FILENAME  Path and filename for the GATK (example: /usr/local/bin/GenomeAnalysisTK/GenomeAnalysisTK.jar)
+
+Optional parameters:
+    -L INT       maximum number of iterations before stopping (default value: 100).
+    -B STR       Sequencing barcode. Assists with sequence identification. 
+                 Only use uppercase A,T,C,G (example: TCCGCGAA-CCTATCCT) (default: ATCG).
+    -C INT       Predicted coverage of region (example: 100) (default: 1000).
+                 Note: The program will not work well in a repeat or extremely high coverage area. Maximum allowable coverage is 3X average.
+    -t INT       Number of threads; recommend 8 or more (default: 1).
+
+    -h           Show this help text.
+"
+
+if [ $# -eq 0 ]; then
+    echo "$usage"
+    exit 0
+else
+
+nloops=100
+LB="ATCG"
+Coverage=1000
+threads=1
+
+
+while getopts ':1:2:R:i:P:G:L:B:C:t:h' option; do
+  case "$option" in
+    1) fastq1=$OPTARG
+       ;;
+    2) fastq2=$OPTARG
+       ;;
+    R) REF_file_original=$OPTARG
+       ;;
+    i) insert_size=$OPTARG
+       ;;
+    P) picard_path=$OPTARG
+       ;;
+    G) GATK_path=$OPTARG
+       ;;
+    L) nloops=$OPTARG
+       ;;
+    B) LB=$OPTARG
+       ;;
+    C) Coverage=$OPTARG
+       ;;
+    t) threads=$OPTARG
+       ;;
+    :) printf "missing argument for -%s\n\n" "$OPTARG" >&2
+       echo "$usage" >&2
+       exit 1
+       ;;
+    h) echo "$usage"
+       exit 1
+       ;;
+   \?) printf "illegal option: -%s\n\n" "$OPTARG" >&2
+       echo "$usage" >&2
+       exit 1
+       ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+###Check if all necessary files and programs are present
+errors=1
+if [ ! -e "$fastq1" ]; then
+    echo "Error: Fastq1 path and filename does not exist (-1)"
+    errors=0
+fi
+
+if [ ! -e "$fastq2" ]; then
+    echo "Error: Fastq2 path and filename does not exist (-2)"
+    errors=0
+fi
+
+if [ ! -e "$REF_file_original" ]; then
+    echo "Error: Reference fasta path and filename does not exist (-R)"
+    errors=0
+else
+    if [ ! `grep "NNNNNNNNNN" $REF_file_original` ]; then 
+        echo "Error: Reference file is not in the correct format. The reference should contain 10 N's."
+        errors=0
+    fi
+    ref_lines=`wc -l $REF_file_original | cut -c 1-2`
+    if [ "$ref_lines" != "2 " ]; then
+        echo "Error: The reference should be two lines, Line 1 is the header (example: >Dcarota.1234), and line 2 the sequence"
+        errors=0
+    fi
+fi
+
+if [ ! "$insert_size" ]; then
+    echo "Error: Insert size not stated (-i)"
+    errors=0
+fi
+
+if [ ! -e "$picard_path" ]; then
+    echo "Error: Picard Tools path and filename does not exist (-P)"
+    errors=0
+fi
+
+if [ ! -e "$GATK_path" ]; then
+    echo "Error: The GATK path and filename does not exist (-G)"
+    errors=0
+fi
+
+perl_check=`which perl 2> /dev/null | wc -l`
+if [ $perl_check == 0 ]; then
+    echo "Perl is not available in PATH"
+    errors=0
+fi
+
+perl_module_check=`perl -MBio::AlignIO -e 1 2>&1 | wc -l`
+if [ $perl_module_check -ge 1 ]; then
+    echo "Perl -MBio::AlignIO is not installed"
+    errors=0
+fi
+
+muscle_check=`which muscle 2> /dev/null | wc -l`
+if [ $muscle_check == 0 ]; then
+    echo "MUSCLE is not available in PATH (http://drive5.com/muscle/)"
+    errors=0
+fi
+
+bwa_check=`which bwa 2> /dev/null | wc -l`
+if [ $bwa_check == 0 ]; then
+    echo "BWA-MEM is not available in PATH (http://bio-bwa.sourceforge.net/)"
+    errors=0
+fi
+
+samtools_check=`which samtools 2> /dev/null | wc -l`
+if [ $samtools_check == 0 ]; then
+    echo "SAMtools is not available in PATH (http://samtools.sourceforge.net/)"
+    errors=0
+fi
+
+if [ $errors == 0 ]; then
+    exit 2
+fi
+
+
+cp $REF_file_original copy.$REF_file_original
+REF_file="copy.$REF_file_original"
+Index="$REF_file.fai"
+PI=`grep ">" $REF_file | cut -c 2-`
+RG="@RG\tID:$PI\tLB:$LB\tPL:illumina\tSM:$PI\tPI:$insert_size"
+
+##################################################Start commands##################################################
+
+while [ $nloops -ge 1 ]; do
+
+rm -f $REF_file.* $PI.CPLXwalker*.bam* ${PI}_cov.* $PI.CPLXwalker.* copy.*.dict metrics.$PI.CPLXwalker.txt
+
+###Index Reference
+if [ ! -e $Index ]; then
+    bwa index $REF_file
+    samtools faidx $REF_file
+else
+    echo "Reference file is indexed"
+fi
+
+
+###Map all reads to reference; sort and index
+if [ ! -e $PI.CPLXwalker.bam ]; then
+    bwa mem -a -M -t $threads -R $RG $REF_file $fastq1 $fastq2 | awk '$3 != "*"' >$PI.CPLXwalker.sam
+    samtools view -bt $Index -o $PI.CPLXwalker.delete.bam $PI.CPLXwalker.sam
+    samtools sort $PI.CPLXwalker.delete.bam $PI.CPLXwalker.delete2
+    java -Xmx2g -jar $picard_path MarkDuplicates I=$PI.CPLXwalker.delete2.bam M=metrics.$PI.CPLXwalker.txt MAX_FILE_HANDLES_FOR_READ_ENDS_MAP=900 O=$PI.CPLXwalker.delete3.bam
+    samtools index $PI.CPLXwalker.delete3.bam
+    java -jar -Xmx2g $picard_path CreateSequenceDictionary REFERENCE=$REF_file OUTPUT=${REF_file::(-2)}dict
+    java -jar -Xmx2g $GATK_path -T RealignerTargetCreator -R $REF_file -I $PI.CPLXwalker.delete3.bam -o $PI.target_intervals.list
+    java -jar -Xmx2g $GATK_path -T IndelRealigner -R $REF_file -I $PI.CPLXwalker.delete3.bam -targetIntervals $PI.target_intervals.list -o $PI.CPLXwalker.bam
+else
+    echo "Initial BAM file has been created"
+fi
+
+rm -f $PI.CPLXwalker.sam $PI.CPLXwalker.delete.bam $PI.CPLXwalker.delete2.bam $PI.CPLXwalker.delete3.bam* $PI.target_intervals.list
+
+###Phase the results in order to continue with 1 reference
+if [ ! -e $PI.CPLXwalker.ds.bam ]; then
+    java -jar -Xmx2g $GATK_path -T DepthOfCoverage -R $REF_file -o ${PI}_cov -I $PI.CPLXwalker.bam
+    c=`awk '$2 != 0 { sum += $2 } END {if (NR > 0) print int(sum / NR) }' ${PI}_cov`
+    if [ $c -ge 100 ]; then
+        d=`printf "%0.3f" $( bc <<< "scale=3;100/$c")`
+        java -Xmx2g -jar $picard_path DownsampleSam I=$PI.CPLXwalker.bam O=$PI.CPLXwalker.ds.bam P=$d
+    else
+        cp $PI.CPLXwalker.bam $PI.CPLXwalker.ds.bam
+    fi
+    samtools phase -b $PI.CPLXwalker $PI.CPLXwalker.ds.bam >$PI.CPLXwalker.phase_output.txt
+fi
+
+if [ -e $PI.CPLXwalker.2.bam ]; then
+    samtools index $PI.CPLXwalker.2.bam
+    new_bam="$PI.CPLXwalker.2.bam"
+else
+    samtools index $PI.CPLXwalker.0.bam
+    new_bam="$PI.CPLXwalker.0.bam"
+fi
+
+###Find the position of N's, pull reads mapping to that position, align reads, and replace new sequence in reference files
+position=`awk 'END{print index($0,"NNNNNNNNNN")}' $REF_file`
+left_pos=$((position-5))
+right_pos=$((position+15))
+max_coverage=$((Coverage*3))
+left_coverage=`grep "$left_pos" ${PI}_cov | awk '{OFS="\t"; print $4}'`
+right_coverage=`grep "$right_pos" ${PI}_cov | awk '{OFS="\t"; print $4}'`
+
+samtools view -b $new_bam $PI:$left_pos-$left_pos >left.bam
+samtools view -b $new_bam $PI:$right_pos-$right_pos >right.bam
+samtools view left.bam | awk '{OFS="\t"; if ($left_pos - $4 <= 50) print ">"$1"\n"$10}' - >left.fasta
+samtools view right.bam | awk '{OFS="\t"; if ($4 - $right_pos >= 50) print ">"$1"\n"$10}' - >right.fasta
+
+
+if [ ! -s left.fasta ]; then ###This does the left side of the N's when present
+    cp $REF_file NewReference.fa
+else
+    if [ "$left_coverage" -le "$max_coverage" ]; then
+        muscle -in left.fasta -out left_aligned.fasta
+        perl -MBio::AlignIO -e 'my $aln = Bio::AlignIO->new(-file => shift); my $str = $aln->next_aln(); print $str->consensus_string(1)' left_aligned.fasta >left_consensus.fasta
+        sed -i 's|?||g' left_consensus.fasta
+    fi
+    old_left_seq_part=`perl -lne 'print $1 if /(([ATCGatcg]{15})[ATCGatcg]{20}N{10})/' $REF_file | cut -c 1-15`
+    old_left_seq_all=`perl -lne 'print $1 if /(([ATCGatcg]{15})[ATCGatcg]{20}N{10})/' $REF_file | cut -c 1-35`
+    new_left_seq=`perl -lne 'print lc($1) if /('$old_left_seq_part'(\w*)$)/' left_consensus.fasta`
+    find_left_sequence=`perl -ne 'm/('$old_left_seq_all')/; {print "$1\n";}' $REF_file`
+    count_left_sequence=`grep -oi $find_left_sequence $REF_file | wc -l`
+    check_new_left_seq=`echo $new_left_seq | wc -c`
+    if ([ $count_left_sequence -eq 1 ] && [ $check_new_left_seq -ge 35 ]); then
+        sed 's|'$old_left_seq_all'|'$new_left_seq'|' $REF_file >NewReference.fa
+    else
+        cp $REF_file NewReference.fa
+    fi
+fi
+
+
+if [ -s right.fasta ]; then ###This does the right side of the N's when present
+    if [ "$right_coverage" -le "$max_coverage" ]; then
+        muscle -in right.fasta -out right_aligned.fasta
+        perl -MBio::AlignIO -e 'my $aln = Bio::AlignIO->new(-file => shift); my $str = $aln->next_aln(); print $str->consensus_string(1)' right_aligned.fasta >right_consensus.fasta
+        sed -i 's|?||g' right_consensus.fasta
+    fi
+    old_right_seq_part=`perl -lne 'print $1 if /(N{10}[ATCGatcg]{20}([ATCGatcg]{15}))/' $REF_file | cut -c 31-`
+    old_right_seq_all=`perl -lne 'print $1 if /(N{10}[ATCGatcg]{20}([ATCGatcg]{15}))/' $REF_file | cut -c 11-`
+    new_right_seq=`perl -lne 'print lc($1) if /(^(\w*)'$old_right_seq_part')/' right_consensus.fasta`
+    find_right_sequence=`perl -ne 'm/('$old_right_seq_all')/; {print "$1\n";}' $REF_file`
+    count_right_sequence=`grep -oi $find_right_sequence $REF_file | wc -l`
+    check_new_right_seq=`echo $new_right_seq | wc -c`
+    if ([ $count_right_sequence -eq 1 ] && [ $check_new_right_seq -ge 35 ]); then
+        sed -i 's|'$old_right_seq_all'|'$new_right_seq'|' NewReference.fa
+    fi
+fi
+
+###Check to see if the program should continue or state why it ended
+original_size=`wc -c $REF_file | cut -f1 -d' '`
+new_size=`wc -c NewReference.fa | cut -f1 -d' '`
+
+if [ $original_size -ge $new_size ]; then
+    echo "No new sequence could be added"
+    cp NewReference.fa ${PI}_loop${nloops}.fa
+    nloops=0
+    mv NewReference.fa $PI.CPLXfinal_walker.fa
+elif ([ "$right_coverage" -gt "$max_coverage" ] && [ "$left_coverage" -gt "$max_coverage" ]); then
+    echo "Both left and right sides have too high coverage to continue"
+    cp NewReference.fa ${PI}_loop${nloops}.fa
+    nloops=0
+    mv NewReference.fa $PI.CPLXfinal_walker.fa
+elif ([ -s left.fasta ] && [ -s right.fasta ]); then
+    find_left_stop=`perl -ne 'm/([ATCGatcg]{20})N{10}/; {print "$1\n";}' NewReference.fa`
+    count_left_stop=`grep -oi $find_left_stop NewReference.fa | wc -l`
+    find_right_stop=`perl -ne 'm/N{10}([ATCGatcg]{20})/; {print "$1\n";}' NewReference.fa`
+    count_right_stop=`grep -oi $find_right_stop NewReference.fa | wc -l`
+    if ([ $count_left_stop -ge 2 ] && [ $count_right_stop -ge 2 ]); then
+        echo "The left side and right side probably meet."
+        cp NewReference.fa ${PI}_loop${nloops}.fa
+        nloops=0
+        mv NewReference.fa $PI.CPLXfinal_walker.fa
+    fi
+else
+    cp NewReference.fa ${PI}_loop${nloops}.fa
+    mv NewReference.fa $REF_file
+    echo "Finished loop $nloops"
+    nloops=$((nloops-1))
+fi
+
+done ###while nloops -ge 1 
+
+rm -f copy.$REF_file_original* left.bam right.bam left.fasta right.fasta left_aligned.fasta left_consensus.fasta right_aligned.fasta right_consensus.fasta ${PI}_cov ${PI}_cov.sample_* $PI.CPLXwalker.bai $PI.CPLXwalker.phase_output.txt copy.*.dict $PI.CPLXwalker.{ds,chimera,0,1,2}.bam*
+
+
+fi ###done with checking if there was no input, need at all times
+##################################################End commands##################################################

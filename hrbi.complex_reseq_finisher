@@ -1,0 +1,245 @@
+#!/bin/bash
+#####################################################################################################################################################   
+###  title          :hrbi.simple_reseq_finisher                                                                                                   ###
+###  description    :This program is a complement to hrbi.complex_reseq_walker. It takes the final output file (*.final_walker.fa) and corrects   ###
+###                  the errors that were generated.                                                                                              ###
+###  author	    :Holly Ruess (Holly.Ruess@ars.usda.gov)                                                                                       ###
+###  date           :04-12-2016                                                                                                                   ###
+###  version        :1                                                                                                                            ###   
+###  notes          :Latest versions of BWA-MEM and SAMtools must be installed and available within PATH. Also install the latest version of      ###
+###                  Picard Tools and GATK and make the corresponding version of java available within PATH.                                      ###
+#####################################################################################################################################################
+
+usage="$(basename "$0") -1 <fastq1> -2 <fastq2> -R <reference_fasta> -i <insert_size> -P <Picard_tools> -G <GATK> [-B <barcode_sequence>] [-t <threads>]
+
+For use with Illumina paired-end reads in a heterozygous reference region.
+Latest versions of BWA-MEM and SAMtools must be installed and available within PATH. Also install the latest version of Picard Tools and GATK and make the corresponding version of java available within PATH. Tested with bwa-0.7.13, samtools-0.1.19, Picard Tools 1.127, GATK 3.5-0-g36282e4, and java 1.7.0_80.
+The final output will be either *.final_CPLXfinisher.2.fa (if the region is homozygous) or *.final_CPLXfinisher.0.fa and *.final_CPLXfinisher.1.fa (if the region is heterozygous) that has sequence added (from hrbi.complex_reseq_walker) and sequence corrected for SNP's and indels. Completeness and correctness of sequence is still dependant on the completeness of the reference, quality and quantity of of initial fastq files, and the amount of heterozygosity (ie. 2+ SNPs for every insert size; example there must be 2 SNPs on average for every 500 bps if the average insert size is 500 bp.
+Phasing works best with higher coverages, but this program downsamples to an average coverage of 100 in order to run samtools phase.
+
+Required parameters:
+    -1 FILENAME  Path and filename for cleaned or uncleaned Illumina fastq 1 file (example: /usr/local/bin/sample.1.fastq.gz)
+                 Note: File can be uncompressed (*.fastq) or compressed (*.fastq.gz)
+    -2 FILENAME  Path and filename for cleaned or uncleaned Illumina fastq 2 file (example: /usr/local/bin/sample.2.fastq.gz)
+                 Note: File can be uncompressed (*.fastq) or compressed (*.fastq.gz)
+    -R FILENAME  Path and filename for input reference fasta file (example: /usr/local/bin/CPLXfinal_walker.fa).
+                 Note1: The reference should be two lines, Line 1 is the header (Keep short and only use letters, numbers, and periods; 
+                 example: >Dcarota.1234), and line 2 the sequence (case-insensitive).
+                 Note2: The reference contains 10 N's in the sequence at either the beginning (example: NNNNNNNNNNATCG), 
+                        middle (example: ATCGNNNNNNNNNNATCG), or end (example: ATCGNNNNNNNNNN).
+                 Note3: The header name will be the sample output name for the program.
+    -i INT       Illumina paired end insert size (example: 350; if the insert size is 350 bp)
+    -P FILENAME  Path and filename for Picard Tools (example: /usr/local/bin/picard-tools/picard.jar)
+    -G FILENAME  Path and filename for the GATK (example: /usr/local/bin/GenomeAnalysisTK/GenomeAnalysisTK.jar)
+
+Optional parameters:
+    -B STR       Sequencing barcode. Assists with sequence identification. 
+                 Only use uppercase A,T,C,G (example: TCCGCGAA-CCTATCCT) (default: ATCG).
+    -t INT       Number of threads; recommend 8 or more (default: 1).
+
+    -h           Show this help text
+"
+
+if [ $# -eq 0 ]; then
+    echo "$usage"
+    exit 0
+else
+
+threads=1
+LB="ATCG"
+
+while getopts ':1:2:R:i:P:G:B:t:h' option; do
+  case "$option" in
+    1) fastq1=$OPTARG
+       ;;
+    2) fastq2=$OPTARG
+       ;;
+    R) REF_file_original=$OPTARG
+       ;;
+    i) insert_size=$OPTARG
+       ;;
+    P) picard_path=$OPTARG
+       ;;
+    G) GATK_path=$OPTARG
+       ;;
+    B) LB=$OPTARG
+       ;;
+    t) threads=$OPTARG
+       ;;
+    :) printf "missing argument for -%s\n\n" "$OPTARG" >&2
+       echo "$usage" >&2
+       exit 1
+       ;;
+    h) echo "$usage"
+       exit 1
+       ;;
+   \?) printf "illegal option: -%s\n\n" "$OPTARG" >&2
+       echo "$usage" >&2
+       exit 1
+       ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+###Check if all neccessary files and programs are present
+errors=1
+if [ ! -e "$fastq1" ]; then
+    echo "Error: Fastq1 path and filename does not exist (-1)"
+    errors=0
+fi
+
+if [ ! -e "$fastq2" ]; then
+    echo "Error: Fastq2 path and filename does not exist (-2)"
+    errors=0
+fi
+
+if [ ! -e "$REF_file_original" ]; then
+    echo "Error: Reference fasta path and filename does not exist (-R)"
+    errors=0
+else
+    if [ ! `grep "NNNNNNNNNN" $REF_file_original` ]; then 
+        echo "Error: Reference file is not in the correct format. The reference should contain 10 N's."
+        errors=0
+    fi
+    ref_lines=`wc -l $REF_file_original | cut -c 1-2`
+    if [ "$ref_lines" != "2 " ]; then
+        echo "Error: The reference should be two lines, Line 1 is the header (example: >Dcarota1234), and line 2 the sequence"
+        errors=0
+    fi
+fi
+
+if [ ! "$insert_size" ]; then
+    echo "Error: Insert size not stated (-i)"
+    errors=0
+fi
+
+if [ ! -e "$picard_path" ]; then
+    echo "Error: Picard Tools path and filename does not exist (-P)"
+    errors=0
+fi
+
+if [ ! -e "$GATK_path" ]; then
+    echo "Error: The GATK path and filename does not exist (-G)"
+    errors=0
+fi
+
+bwa_check=`which bwa 2> /dev/null | wc -l`
+if [ $bwa_check == 0 ]; then
+    echo "BWA-MEM is not available in PATH (http://bio-bwa.sourceforge.net/)"
+    errors=0
+fi
+
+samtools_check=`which samtools 2> /dev/null | wc -l`
+if [ $samtools_check == 0 ]; then
+    echo "SAMtools is not available in PATH (http://samtools.sourceforge.net/)"
+    errors=0
+fi
+
+java_check=`which java 2> /dev/null | wc -l`
+if [ $java_check == 0 ]; then
+    echo "Java is not available in PATH"
+    errors=0
+fi
+
+if [ $errors == 0 ]; then
+    exit 2
+fi
+
+###Set some variables
+PI=`grep ">" $REF_file_original | cut -c 2-`
+RG="@RG\tID:$PI\tLB:$LB\tPL:illumina\tSM:$PI\tPI:$insert_size"
+Index="$REF_file.fai"
+###The following 'Heredoc' takes the cigar in the bam file and only outputs reads that have at least 50% of it's bases mapping
+MDtag_parse=$(cat <<'EOF'
+while (my $lines = <>) {
+    if ($lines =~ m/^@/)                    {print "$lines"};
+    next if ($lines =~ m/^@/);
+    my @col = split (/\t/, $lines);
+    my ($seq_length) = length($col[9]);
+    next if ($col[5] =~ m/X/);
+    my $aligned_length = 0;
+    if ($col[5] =~ m/=/)                    {$aligned_length = $seq_length;}
+    while ($col[5] =~ m/(\d+)[MI]/g)        {$aligned_length += $1;}
+    if ($aligned_length/$seq_length >= 0.5) {print "$lines";}
+}
+EOF
+)
+
+##################################################Start commands##################################################
+
+####Check to see if you can run this program, and make new reference without the N's
+no_connection=`awk '/^NNNNNNNNNN|NNNNNNNNNN$/ {print "keepNs"}' $REF_file_original`
+
+if [ $no_connection == "keepNs" ]; then
+    cp $REF_file_original $PI.ref_CPLXfinisher.fa
+else
+    find_left_stop=`perl -ne 'm/([ATCGatcg]{20})N{10}/; {print "$1\n";}' $REF_file_original | grep .`
+    count_left_stop=`grep -oi $find_left_stop $REF_file_original | wc -l`
+    find_right_stop=`perl -ne 'm/N{10}([ATCGatcg]{20})/; {print "$1\n";}' $REF_file_original`
+    count_right_stop=`grep -oi $find_right_stop $REF_file_original | wc -l`
+    if ([ $count_left_stop -ge 2 ] && [ $count_right_stop -ge 2 ]); then
+        sed  -e 's|'$find_left_stop'[N]\{10\}[ATCGatcg]*'$find_left_stop'|'$find_left_stop'|' $REF_file_original >$PI.ref_CPLXfinisher.fa
+    else
+    cp $REF_file_original $PI.ref_CPLXfinisher.fa
+    fi
+fi
+
+REF_file="$PI.ref_CPLXfinisher.fa"
+
+
+###Map reads to sequence, mark duplicates, and realign around indels
+if [ ! -e $PI.CPLXfinisher.bam ]; then
+    bwa index $REF_file
+    samtools faidx $REF_file
+    java -jar -Xmx2g $picard_path CreateSequenceDictionary REFERENCE=$REF_file OUTPUT=${REF_file::(-2)}dict
+    ###This removes reads where less than 50% of their legnth doesn't map; for instance too much soft clipping. Please comment out and use the other line if it causes trouble.
+    bwa mem -a -M -t $threads -R $RG $REF_file $fastq1 $fastq2 | awk '$3 != "*"' | perl -e "$MDtag_parse" >$PI.CPLXfinisher.sam
+#    bwa mem -a -M -t $threads -R $RG $REF_file $fastq1 $fastq2 | awk '$3 != "*"' >$PI.CPLXfinisher.sam
+    samtools view -bt $Index -o $PI.CPLXfinisher_delete.bam $PI.CPLXfinisher.sam
+    samtools sort $PI.CPLXfinisher_delete.bam $PI.CPLXfinisher_delete2
+    java -Xmx2g -jar $picard_path MarkDuplicates I=$PI.CPLXfinisher_delete2.bam M=metrics.$PI.CPLXfinisher.txt MAX_FILE_HANDLES_FOR_READ_ENDS_MAP=900 O=$PI.CPLXfinisher_delete3.bam
+    samtools index $PI.CPLXfinisher_delete3.bam
+    java -jar -Xmx2g $GATK_path -T RealignerTargetCreator -R $REF_file -I $PI.CPLXfinisher_delete3.bam -o $PI.target_intervals.list
+    java -jar -Xmx2g $GATK_path -T IndelRealigner -R $REF_file -I $PI.CPLXfinisher_delete3.bam -targetIntervals $PI.target_intervals.list -o $PI.CPLXfinisher.bam
+
+else
+    echo "BAM file has been created"
+fi
+
+rm -f $PI.CPLXfinisher.sam $PI.CPLXfinisher_delete.bam $PI.CPLXfinisher_delete2.bam $PI.CPLXfinisher_delete3.bam* $PI.target_intervals.list
+
+
+###Find coverage; downsampling to average coverage less than 100 (note that phasing works best with coverage below 100). Then phase.
+java -jar -Xmx4g $GATK_path -T DepthOfCoverage -R $REF_file -o ${PI}_cov -I $PI.CPLXfinisher.bam
+c=`awk '$2 != 0 { sum += $2 } END {if (NR > 0) print int(sum / NR) }' ${PI}_cov`
+if [ $c -ge 100 ]; then
+    d=`printf "%0.3f" $( bc <<< "scale=3;100/$c")`
+    java -Xmx2g -jar $picard_path DownsampleSam I=$PI.CPLXfinisher.bam O=$PI.CPLXfinisher.ds.bam P=$d
+else
+    cp $PI.CPLXfinisher.bam $PI.CPLXfinisher.ds.bam
+fi
+
+samtools phase -b $PI.CPLXfinisher $PI.CPLXfinisher.ds.bam >$PI.CPLXfinisher.phase_output.txt
+
+###Call SNP's and InDels in each phase and output final files
+if [ -e $PI.CPLXfinisher.2.bam ]; then
+    samtools index $PI.CPLXfinisher.2.bam
+    java -jar -Xmx2g $GATK_path -R $REF_file -T HaplotypeCaller -I $PI.CPLXfinisher.2.bam -o $PI.CPLXfinisher_GATK.2.vcf
+    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.final_CPLXfinisher.2.fa -V $PI.CPLXfinisher_GATK.2.vcf -raw
+    sed -i '1s/^/>'$PI'.2\n/' $PI.final_CPLXfinisher.2.fa
+else
+    samtools index $PI.CPLXfinisher.0.bam
+    java -jar -Xmx2g $GATK_path -R $REF_file -T HaplotypeCaller -I $PI.CPLXfinisher.0.bam -o $PI.CPLXfinisher_GATK.0.vcf
+    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.final_CPLXfinisher.0.fa -V $PI.CPLXfinisher_GATK.0.vcf -raw
+    sed -i '1s/^/>'$PI'.0\n/' $PI.final_CPLXfinisher.0.fa
+
+    samtools index $PI.CPLXfinisher.1.bam
+    java -jar -Xmx2g $GATK_path -R $REF_file -T HaplotypeCaller -I $PI.CPLXfinisher.1.bam -o $PI.CPLXfinisher_GATK.1.vcf
+    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.final_CPLXfinisher.1.fa -V $PI.CPLXfinisher_GATK.1.vcf -raw
+    sed -i '1s/^/>'$PI'.1\n/' $PI.final_CPLXfinisher.1.fa
+fi
+
+rm -f $REF_file.* ${REF_file::(-2)}dict ${PI}_cov* $PI.CPLXfinisher_GATK.[0,1,2].vcf*
+
+fi ###done with checking if there was no input, need at all times
+##################################################End commands##################################################
