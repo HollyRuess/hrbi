@@ -232,8 +232,8 @@ position=`awk 'END{print index($0,"NNNNNNNNNN")}' $REF_file`
 left_pos=$((position-5))
 right_pos=$((position+15))
 max_coverage=$((Coverage*3))
-left_coverage=`grep "$left_pos" ${PI}_cov | awk '{OFS="\t"; print $4}'`
-right_coverage=`grep "$right_pos" ${PI}_cov | awk '{OFS="\t"; print $4}'`
+left_coverage=`grep "${PI}:$left_pos" ${PI}_cov | awk '{OFS="\t"; print $4}'`
+right_coverage=`grep "${PI}:$right_pos" ${PI}_cov | awk '{OFS="\t"; print $4}'`
 
 samtools view -b $new_bam $PI:$left_pos-$left_pos >left.bam
 samtools view -b $new_bam $PI:$right_pos-$right_pos >right.bam
@@ -304,6 +304,11 @@ elif ([ -s left.fasta ] && [ -s right.fasta ]); then
         cp NewReference.fa ${PI}_loop${nloops}.fa
         nloops=0
         mv NewReference.fa $PI.CPLXfinal_walker.fa
+    else
+        cp NewReference.fa ${PI}_loop${nloops}.fa
+        mv NewReference.fa $REF_file
+        echo "Finished loop $nloops"
+        nloops=$((nloops-1))    
     fi
 else
     cp NewReference.fa ${PI}_loop${nloops}.fa
