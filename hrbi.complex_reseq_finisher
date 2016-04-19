@@ -25,9 +25,7 @@ Required parameters:
     -R FILENAME  Path and filename for input reference fasta file (example: /usr/local/bin/CPLXfinal_walker.fa).
                  Note1: The reference should be two lines, Line 1 is the header (Keep short and only use letters, numbers, and periods; 
                  example: >Dcarota.1234), and line 2 the sequence (case-insensitive).
-                 Note2: The reference contains 10 N's in the sequence at either the beginning (example: NNNNNNNNNNATCG), 
-                        middle (example: ATCGNNNNNNNNNNATCG), or end (example: ATCGNNNNNNNNNN).
-                 Note3: The header name will be the sample output name for the program.
+                 Note2: The header name will be the sample output name for the program.
     -i INT       Illumina paired end insert size (example: 350; if the insert size is 350 bp)
     -P FILENAME  Path and filename for Picard Tools (example: /usr/local/bin/picard-tools/picard.jar)
     -G FILENAME  Path and filename for the GATK (example: /usr/local/bin/GenomeAnalysisTK/GenomeAnalysisTK.jar)
@@ -97,10 +95,6 @@ if [ ! -e "$REF_file_original" ]; then
     echo "Error: Reference fasta path and filename does not exist (-R)"
     errors=0
 else
-    if [ ! `grep "NNNNNNNNNN" $REF_file_original` ]; then 
-        echo "Error: Reference file is not in the correct format. The reference should contain 10 N's."
-        errors=0
-    fi
     ref_lines=`wc -l $REF_file_original | cut -c 1-2`
     if [ "$ref_lines" != "2 " ]; then
         echo "Error: The reference should be two lines, Line 1 is the header (example: >Dcarota1234), and line 2 the sequence"
@@ -310,7 +304,7 @@ else
     sed -i '1s/^/>'$PI'.1\n/' $PI.final_CPLXfinisher.1.fa
 fi
 
-rm -f $REF_file.* ${REF_file::(-2)}dict ${PI}_cov* $PI.CPLXfinisher_GATK.[0,1,2].vcf* $PI.[0,1,2]_cov* $PI.CPLXfinisher.[0,1,2].fa
+rm -f $REF_file.* ${REF_file::(-2)}dict ${PI}_cov* $PI.CPLXfinisher_GATK.[0,1,2].vcf.* $PI.[0,1,2]_cov* $PI.CPLXfinisher.[0,1,2].fa
 
 fi ###done with checking if there was no input, need at all times
 ##################################################End commands##################################################
