@@ -14,8 +14,8 @@ usage="$(basename "$0") -1 <fastq1> -2 <fastq2> -R <reference_fasta> -i <insert_
 
 For use with Illumina paired-end reads in a heterozygous reference region.
 Latest versions of BWA-MEM and SAMtools must be installed and available within PATH. Also install the latest version of Picard Tools and GATK and make the corresponding version of java available within PATH. Tested with bwa-0.7.13, samtools-0.1.19, Picard Tools 1.127, GATK 3.5-0-g36282e4, and java 1.7.0_80.
-The final output will be either *.final_CPLXfinisher.2.fa (if the region is homozygous) or *.final_CPLXfinisher.0.fa and *.final_CPLXfinisher.1.fa (if the region is heterozygous) that has sequence added (from hrbi.complex_reseq_walker) and sequence corrected for SNP's and indels. Completeness and correctness of sequence is still dependant on the completeness of the reference, quality and quantity of of initial fastq files, and the amount of heterozygosity (ie. 2+ SNPs for every insert size; example there must be 2 SNPs on average for every 500 bps if the average insert size is 500 bp.
-Phasing works best with higher coverages, but this program downsamples to an average coverage of 100 in order to run samtools phase.
+The final output will be either *.final_CPLXfinisher.2.fa (if the region is homozygous) or *.final_CPLXfinisher.0.fa and *.final_CPLXfinisher.1.fa (if the region is heterozygous) that has sequence added (from hrbi.complex_reseq_walker) and sequence corrected for SNP's and indels when the coverage of each base is greater than 20% the average coverage. Completeness and correctness of sequence is still dependant on the completeness of the reference, quality and quantity of of initial fastq files, and the amount of heterozygosity (ie. 2+ SNPs for every insert size; example there must be 2 SNPs on average for every 500 bps if the average insert size is 500 bp.
+Phasing works best with higher coverages, but this program downsamples to an average coverage of 100.
 
 Required parameters:
     -1 FILENAME  Path and filename for cleaned or uncleaned Illumina fastq 1 file (example: /usr/local/bin/sample.1.fastq.gz)
@@ -165,6 +165,57 @@ while (my $lines = <>) {
 EOF
 )
 
+###The following 'Heredoc' takes the coverage file and changes a base to "N" when the base is <= 20% the average coverage
+read -r -d '' perlscript_low_coverage <<'EOF'
+use strict; use warnings;
+my ($cov_file, $seq_file) = @ARGV;
+
+my ($cov_file, $seq_file) = @ARGV;
+
+open(FH,"<","$cov_file") or die;
+
+my $count = 0;
+my $total = 0;
+
+my @coord_last;
+while (my $lines = <FH>) {
+    chomp $lines;
+    next if ($lines =~ m/^Locus/);
+    my @col2 = split (/\t/, $lines);
+    @coord_last = split (/:/, $col2[0]);
+    $count++;
+    $total += $col2[1];
+}
+my $last = $coord_last[1];
+
+my $average = $total/$count;
+
+seek FH, 0, 0;
+
+my $string;
+open(FH2,"<","$seq_file") or die;
+$string = join("", <FH2>);
+my @check;
+while (my $same_file = <FH>) {
+    next if ($same_file =~ m/^Locus/);
+    my @col = split (/\t/, $same_file);
+    my ($name, $coordinate) = $col[0] =~ m/(.*):(\d+)/;
+    if (($col[1]) <= (0.2*$average)) {
+    substr ($string, $coordinate-1, 1) =~ s/(.)/N/;
+    }
+    $check[$coordinate] = 1;
+}
+for my $i (1..$last) {
+    if ( ! defined ($check[$i])) {
+        substr ($string, $i-1, 1) =~ s/(.)/N/;
+    }
+}
+
+print "$string";
+close FH;
+close FH2;
+EOF
+
 ##################################################Start commands##################################################
 
 ####Check to see if you can run this program, and make new reference without the N's
@@ -201,7 +252,6 @@ if [ ! -e $PI.CPLXfinisher.bam ]; then
     samtools index $PI.CPLXfinisher_delete3.bam
     java -jar -Xmx2g $GATK_path -T RealignerTargetCreator -R $REF_file -I $PI.CPLXfinisher_delete3.bam -o $PI.target_intervals.list
     java -jar -Xmx2g $GATK_path -T IndelRealigner -R $REF_file -I $PI.CPLXfinisher_delete3.bam -targetIntervals $PI.target_intervals.list -o $PI.CPLXfinisher.bam
-
 else
     echo "BAM file has been created"
 fi
@@ -221,25 +271,46 @@ fi
 
 samtools phase -b $PI.CPLXfinisher $PI.CPLXfinisher.ds.bam >$PI.CPLXfinisher.phase_output.txt
 
+
 ###Call SNP's and InDels in each phase and output final files
-if [ -e $PI.CPLXfinisher.2.bam ]; then
+no_phasing=`samtools view $PI.CPLXfinisher.0.bam | wc -l`
+if [ $no_phasing == 0 ]; then
+    cp $PI.CPLXfinisher.ds.bam $PI.CPLXfinisher.2.bam
     samtools index $PI.CPLXfinisher.2.bam
+    rm $PI.CPLXfinisher.0.bam* $PI.CPLXfinisher.1.bam*
     java -jar -Xmx2g $GATK_path -R $REF_file -T HaplotypeCaller -I $PI.CPLXfinisher.2.bam -o $PI.CPLXfinisher_GATK.2.vcf
-    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.final_CPLXfinisher.2.fa -V $PI.CPLXfinisher_GATK.2.vcf -raw
-    sed -i '1s/^/>'$PI'.2\n/' $PI.final_CPLXfinisher.2.fa
+    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.CPLXfinisher.2.fa -V $PI.CPLXfinisher_GATK.2.vcf -raw
+    
 else
     samtools index $PI.CPLXfinisher.0.bam
     java -jar -Xmx2g $GATK_path -R $REF_file -T HaplotypeCaller -I $PI.CPLXfinisher.0.bam -o $PI.CPLXfinisher_GATK.0.vcf
-    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.final_CPLXfinisher.0.fa -V $PI.CPLXfinisher_GATK.0.vcf -raw
-    sed -i '1s/^/>'$PI'.0\n/' $PI.final_CPLXfinisher.0.fa
+    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.CPLXfinisher.0.fa -V $PI.CPLXfinisher_GATK.0.vcf -raw
 
     samtools index $PI.CPLXfinisher.1.bam
     java -jar -Xmx2g $GATK_path -R $REF_file -T HaplotypeCaller -I $PI.CPLXfinisher.1.bam -o $PI.CPLXfinisher_GATK.1.vcf
-    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.final_CPLXfinisher.1.fa -V $PI.CPLXfinisher_GATK.1.vcf -raw
+    java -jar $GATK_path -T FastaAlternateReferenceMaker -R $REF_file -o $PI.CPLXfinisher.1.fa -V $PI.CPLXfinisher_GATK.1.vcf -raw
+    
+fi
+
+###find coverage of phase files and correct the fasta file if the coverage dips below 20% of average
+if [ -e $PI.CPLXfinisher.2.bam ]; then
+    java -jar -Xmx4g $GATK_path -T DepthOfCoverage -R $REF_file -o ${PI}.2_cov -I $PI.CPLXfinisher.2.bam
+    cov_2=`awk '$2 != 0 { sum += $2 } END {if (NR > 0) print int(sum / NR) }' ${PI}.2_cov`
+    perl -e "$perlscript_low_coverage" ${PI}.2_cov ${PI}.CPLXfinisher.2.fa >$PI.final_CPLXfinisher.2.fa
+    sed -i '1s/^/>'$PI'.2\n/' $PI.final_CPLXfinisher.2.fa
+else
+    java -jar -Xmx4g $GATK_path -T DepthOfCoverage -R $REF_file -o ${PI}.0_cov -I $PI.CPLXfinisher.0.bam
+    cov_0=`awk '$2 != 0 { sum += $2 } END {if (NR > 0) print int(sum / NR) }' ${PI}.0_cov`
+    perl -e "$perlscript_low_coverage" ${PI}.0_cov ${PI}.CPLXfinisher.0.fa >$PI.final_CPLXfinisher.0.fa
+    sed -i '1s/^/>'$PI'.0\n/' $PI.final_CPLXfinisher.0.fa
+
+    java -jar -Xmx4g $GATK_path -T DepthOfCoverage -R $REF_file -o ${PI}.1_cov -I $PI.CPLXfinisher.1.bam
+    cov_1=`awk '$2 != 0 { sum += $2 } END {if (NR > 0) print int(sum / NR) }' ${PI}.1_cov`
+    perl -e "$perlscript_low_coverage" ${PI}.1_cov ${PI}.CPLXfinisher.1.fa >$PI.final_CPLXfinisher.1.fa
     sed -i '1s/^/>'$PI'.1\n/' $PI.final_CPLXfinisher.1.fa
 fi
 
-rm -f $REF_file.* ${REF_file::(-2)}dict ${PI}_cov* $PI.CPLXfinisher_GATK.[0,1,2].vcf*
+rm -f $REF_file.* ${REF_file::(-2)}dict ${PI}_cov* $PI.CPLXfinisher_GATK.[0,1,2].vcf* $PI.[0,1,2]_cov* $PI.CPLXfinisher.[0,1,2].fa
 
 fi ###done with checking if there was no input, need at all times
 ##################################################End commands##################################################
